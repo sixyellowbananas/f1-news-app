@@ -1,9 +1,42 @@
-// F1 News Web App - Main JavaScript
+// F1 News Web App - Multi-Feed Version
 
-const FEED_URL = 'https://f1tribe.com/feedme/go-working.php?v=17591122wtwet89473';
+const FEEDS = [
+    {
+        name: 'F1Tribe Aggregator',
+        url: 'https://f1tribe.com/feedme/go-working.php?v=17591122wtwet89473',
+        type: 'json',
+        enabled: true
+    },
+    {
+        name: 'Formula1.com',
+        url: 'https://www.formula1.com/en/latest/all.xml',
+        type: 'rss',
+        enabled: true
+    },
+    {
+        name: 'Autosport F1',
+        url: 'https://www.autosport.com/rss/feed/f1',
+        type: 'rss',
+        enabled: true
+    },
+    {
+        name: 'RaceFans',
+        url: 'https://www.racefans.net/feed/',
+        type: 'rss',
+        enabled: true
+    },
+    {
+        name: 'PlanetF1',
+        url: 'https://www.planetf1.com/feed/',
+        type: 'rss',
+        enabled: true
+    }
+];
+
 const REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes
 const STORAGE_KEY = 'f1_seen_articles';
 const AUTO_REFRESH_KEY = 'f1_auto_refresh';
+const FEED_SETTINGS_KEY = 'f1_feed_settings';
 
 let articles = [];
 let seenArticleIds = new Set();
@@ -13,6 +46,7 @@ let refreshTimer = null;
 // Initialize app
 document.addEventListener('DOMContentLoaded', () => {
     loadSeenArticles();
+    loadFeedSettings();
     checkNotificationPermission();
     checkInstallPrompt();
     
@@ -59,6 +93,32 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 });
 
+// Load feed settings
+function loadFeedSettings() {
+    const stored = localStorage.getItem(FEED_SETTINGS_KEY);
+    if (stored) {
+        try {
+            const settings = JSON.parse(stored);
+            FEEDS.forEach(feed => {
+                if (settings[feed.name] !== undefined) {
+                    feed.enabled = settings[feed.name];
+                }
+            });
+        } catch (e) {
+            console.error('Error loading feed settings:', e);
+        }
+    }
+}
+
+// Save feed settings
+function saveFeedSettings() {
+    const settings = {};
+    FEEDS.forEach(feed => {
+        settings[feed.name] = feed.enabled;
+    });
+    localStorage.setItem(FEED_SETTINGS_KEY, JSON.stringify(settings));
+}
+
 // Load seen articles from localStorage
 function loadSeenArticles() {
     const stored = localStorage.getItem(STORAGE_KEY);
@@ -88,7 +148,72 @@ function isNewArticle(articleId) {
     return !seenArticleIds.has(articleId);
 }
 
-// Fetch news from API
+// Parse RSS feed to articles
+async function parseRSSFeed(xmlText, sourceName) {
+    const parser = new DOMParser();
+    const xmlDoc = parser.parseFromString(xmlText, 'text/xml');
+    
+    const items = xmlDoc.querySelectorAll('item');
+    const articles = [];
+    
+    items.forEach(item => {
+        const title = item.querySelector('title')?.textContent || '';
+        const link = item.querySelector('link')?.textContent || '';
+        const description = item.querySelector('description')?.textContent || '';
+        const pubDate = item.querySelector('pubDate')?.textContent || '';
+        
+        // Create unique ID from link or title
+        const id = `${sourceName}-${link || title}`.replace(/[^a-zA-Z0-9]/g, '-');
+        
+        // Parse date
+        let timestamp = Date.now();
+        if (pubDate) {
+            const date = new Date(pubDate);
+            if (!isNaN(date.getTime())) {
+                timestamp = date.getTime();
+            }
+        }
+        
+        // Calculate relative time
+        const now = Date.now();
+        const diffMs = now - timestamp;
+        const diffMins = Math.floor(diffMs / 60000);
+        const diffHours = Math.floor(diffMins / 60);
+        const diffDays = Math.floor(diffHours / 24);
+        
+        let timeStr = '';
+        if (diffMins < 1) {
+            timeStr = 'Just now';
+        } else if (diffMins < 60) {
+            timeStr = `${diffMins} min${diffMins !== 1 ? 's' : ''} ago`;
+        } else if (diffHours < 24) {
+            timeStr = `${diffHours} hour${diffHours !== 1 ? 's' : ''} ago`;
+        } else if (diffDays < 7) {
+            timeStr = `${diffDays} day${diffDays !== 1 ? 's' : ''} ago`;
+        } else {
+            timeStr = new Date(timestamp).toLocaleDateString();
+        }
+        
+        // Clean up description (remove HTML tags)
+        const cleanDescription = description.replace(/<[^>]*>/g, '').trim();
+        
+        articles.push({
+            id: id,
+            title: title.trim(),
+            summary: cleanDescription.substring(0, 200) + (cleanDescription.length > 200 ? '...' : ''),
+            link: link.trim(),
+            category: 'General',
+            timestamp: timeStr,
+            source: sourceName,
+            priority: 'medium',
+            pubDate: Math.floor(timestamp / 1000)
+        });
+    });
+    
+    return articles;
+}
+
+// Fetch news from all feeds
 async function refreshNews() {
     const refreshBtn = document.getElementById('refresh-btn');
     const refreshIcon = document.getElementById('refresh-icon');
@@ -109,20 +234,61 @@ async function refreshNews() {
     refreshBtn.disabled = true;
     refreshIcon.style.animation = 'spin 1s linear infinite';
     
+    const allArticles = [];
+    const enabledFeeds = FEEDS.filter(feed => feed.enabled);
+    
+    // Fetch all feeds in parallel
+    const feedPromises = enabledFeeds.map(async (feed) => {
+        try {
+            const response = await fetch(feed.url);
+            if (!response.ok) {
+                console.error(`Failed to fetch ${feed.name}: ${response.status}`);
+                return [];
+            }
+            
+            if (feed.type === 'json') {
+                const data = await response.json();
+                if (data.success && data.articles) {
+                    return data.articles.map(article => ({
+                        ...article,
+                        source: article.source || feed.name
+                    }));
+                }
+            } else if (feed.type === 'rss') {
+                const xmlText = await response.text();
+                return await parseRSSFeed(xmlText, feed.name);
+            }
+            
+            return [];
+        } catch (err) {
+            console.error(`Error fetching ${feed.name}:`, err);
+            return [];
+        }
+    });
+    
     try {
-        const response = await fetch(FEED_URL);
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
+        const results = await Promise.all(feedPromises);
+        results.forEach(feedArticles => {
+            allArticles.push(...feedArticles);
+        });
         
-        const data = await response.json();
+        // Sort by pubDate (newest first)
+        allArticles.sort((a, b) => b.pubDate - a.pubDate);
         
-        if (!data.success) {
-            throw new Error(data.message || 'Failed to load feed');
-        }
+        // Remove duplicates based on similar titles
+        const uniqueArticles = [];
+        const seenTitles = new Set();
+        
+        allArticles.forEach(article => {
+            const normalizedTitle = article.title.toLowerCase().replace(/[^a-z0-9]/g, '');
+            if (!seenTitles.has(normalizedTitle)) {
+                seenTitles.add(normalizedTitle);
+                uniqueArticles.push(article);
+            }
+        });
         
         // Find new articles
-        const newArticles = data.articles.filter(article => isNewArticle(article.id));
+        const newArticles = uniqueArticles.filter(article => isNewArticle(article.id));
         
         // Send notifications for new articles
         if (newArticles.length > 0 && Notification.permission === 'granted') {
@@ -130,10 +296,10 @@ async function refreshNews() {
         }
         
         // Mark all articles as seen
-        data.articles.forEach(article => markArticleAsSeen(article.id));
+        uniqueArticles.forEach(article => markArticleAsSeen(article.id));
         
         // Update articles
-        articles = data.articles;
+        articles = uniqueArticles;
         
         // Update UI
         updateArticlesDisplay();
@@ -177,8 +343,8 @@ function sendNotifications(newArticles) {
         setTimeout(() => {
             const notification = new Notification('🏁 New F1 News', {
                 body: `${article.source}: ${article.title}`,
-                icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect fill="%23E10600" width="100" height="100"/><text y="75" x="50" text-anchor="middle" font-size="60" fill="white" font-family="Arial Black">F1</text></svg>',
-                badge: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect fill="%23E10600" width="100" height="100"/><text y="75" x="50" text-anchor="middle" font-size="60" fill="white" font-family="Arial Black">F1</text></svg>',
+                icon: 'icon.png',
+                badge: 'icon.png',
                 tag: article.id,
                 requireInteraction: false,
                 silent: false
@@ -189,7 +355,7 @@ function sendNotifications(newArticles) {
                 notification.close();
                 openArticle(article.link);
             };
-        }, index * 500); // 500ms delay between notifications
+        }, index * 500);
     });
 }
 
@@ -206,7 +372,7 @@ function updateArticlesDisplay() {
         const isNew = isNewArticle(article.id);
         
         return `
-            <div class="article" onclick="openArticle('${article.link}')">
+            <div class="article" onclick="openArticle('${escapeHtml(article.link)}')">
                 <div class="article-header">
                     <div class="article-source">${escapeHtml(article.source)}</div>
                     <div class="article-time">${escapeHtml(article.timestamp)}</div>
@@ -215,7 +381,7 @@ function updateArticlesDisplay() {
                 <div class="article-summary">${escapeHtml(article.summary)}</div>
                 <div class="article-footer">
                     <span class="badge badge-${article.category.toLowerCase()}">${escapeHtml(article.category)}</span>
-                    ${article.priority.toLowerCase() === 'high' ? '<span class="badge badge-priority">⚡ High Priority</span>' : ''}
+                    ${article.priority && article.priority.toLowerCase() === 'high' ? '<span class="badge badge-priority">⚡ High Priority</span>' : ''}
                     ${isNew ? '<span class="badge new-badge">✨ NEW</span>' : ''}
                 </div>
             </div>
@@ -296,9 +462,11 @@ function updateStatusIndicator(active) {
     const statusDot = document.getElementById('status-dot');
     const statusText = document.getElementById('status-text');
     
+    const enabledCount = FEEDS.filter(f => f.enabled).length;
+    
     if (Notification.permission === 'granted' && active) {
         statusDot.className = 'status-dot';
-        statusText.textContent = 'Notifications ON';
+        statusText.textContent = `${enabledCount} Feeds Active`;
     } else if (Notification.permission === 'granted' && !active) {
         statusDot.className = 'status-dot disabled';
         statusText.textContent = 'Paused';
@@ -340,10 +508,9 @@ async function requestNotificationPermission() {
         checkNotificationPermission();
         
         if (permission === 'granted') {
-            // Send test notification
             new Notification('🏁 F1 News', {
-                body: 'Notifications enabled! You\'ll be notified of new F1 articles.',
-                icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect fill="%23E10600" width="100" height="100"/><text y="75" x="50" text-anchor="middle" font-size="60" fill="white" font-family="Arial Black">F1</text></svg>'
+                body: 'Notifications enabled! You\'ll be notified of new F1 articles from multiple sources.',
+                icon: 'icon.png'
             });
         }
     } catch (err) {
@@ -357,7 +524,6 @@ function checkInstallPrompt() {
     const isInStandaloneMode = window.navigator.standalone === true;
     const prompt = document.getElementById('install-prompt');
     
-    // Show install prompt for iOS users not in standalone mode
     if (isIOS && !isInStandaloneMode) {
         prompt.style.display = 'block';
     }
@@ -373,12 +539,11 @@ function escapeHtml(text) {
 // Handle page visibility changes
 document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && autoRefreshEnabled) {
-        // Refresh when page becomes visible
         refreshNews();
     }
 });
 
-// Service Worker registration for better offline support
+// Service Worker registration
 if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(err => {
         console.log('ServiceWorker registration failed:', err);
